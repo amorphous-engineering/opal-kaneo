@@ -15717,16 +15717,26 @@ var plugin_default = definePlugin({
     };
     app.get("/panel/issue", panel("issue", "issue"));
     app.get("/panel/execution", panel("wo", "execution"));
+    let cached = null;
     app.get("/options/projects", async (c) => {
       if (!kaneo)
-        return c.json({ items: [] });
-      const spaces = await kaneo.workspaces();
-      const items = [];
-      for (const w of spaces)
-        for (const p of await kaneo.projects(w.id))
-          items.push({ value: p.id, label: `${spaces.length > 1 ? `${w.name} / ` : ""}${p.name} (${p.slug})` });
-      items.sort((a, b) => a.label.localeCompare(b.label));
-      return c.json({ items });
+        return c.json({ error: "not started" }, 503);
+      if (!cached || Date.now() - cached.at > 300000) {
+        try {
+          const spaces = await kaneo.workspaces();
+          const items = [];
+          for (const w of spaces)
+            for (const p of await kaneo.projects(w.id))
+              items.push({ value: p.id, label: `${spaces.length > 1 ? `${w.name} / ` : ""}${p.name} (${p.slug})` });
+          items.sort((a, b) => a.label.localeCompare(b.label));
+          cached = { at: Date.now(), items };
+        } catch (e) {
+          ctx.log(`project options: ${e.message}`);
+          if (!cached)
+            return c.json({ error: "Kaneo did not answer" }, 502);
+        }
+      }
+      return c.json({ items: cached.items });
     });
     app.post("/sync", async (c) => {
       if (!sync)

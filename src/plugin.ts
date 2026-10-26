@@ -123,16 +123,26 @@ export default definePlugin({
 		app.get('/panel/issue', panel('issue', 'issue'));
 		app.get('/panel/execution', panel('wo', 'execution'));
 
-		// The settings form offers these in its project dropdowns.
+		// The settings form offers these in its project dropdowns. Kept for 5 minutes:
+		// the form can ask while the first poll uses up Kaneo's request rate.
+		let cached: { at: number; items: { value: string; label: string }[] } | null = null;
 		app.get('/options/projects', async (c) => {
-			if (!kaneo) return c.json({ items: [] });
-			const spaces = await kaneo.workspaces();
-			const items: { value: string; label: string }[] = [];
-			for (const w of spaces)
-				for (const p of await kaneo.projects(w.id))
-					items.push({ value: p.id, label: `${spaces.length > 1 ? `${w.name} / ` : ''}${p.name} (${p.slug})` });
-			items.sort((a, b) => a.label.localeCompare(b.label));
-			return c.json({ items });
+			if (!kaneo) return c.json({ error: 'not started' }, 503);
+			if (!cached || Date.now() - cached.at > 300_000) {
+				try {
+					const spaces = await kaneo.workspaces();
+					const items: { value: string; label: string }[] = [];
+					for (const w of spaces)
+						for (const p of await kaneo.projects(w.id))
+							items.push({ value: p.id, label: `${spaces.length > 1 ? `${w.name} / ` : ''}${p.name} (${p.slug})` });
+					items.sort((a, b) => a.label.localeCompare(b.label));
+					cached = { at: Date.now(), items };
+				} catch (e) {
+					ctx.log(`project options: ${(e as Error).message}`);
+					if (!cached) return c.json({ error: 'Kaneo did not answer' }, 502);
+				}
+			}
+			return c.json({ items: cached.items });
 		});
 
 		app.post('/sync', async (c) => {
