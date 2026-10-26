@@ -58,10 +58,32 @@ export class Kaneo {
 		this.base = url.replace(/\/+$/, '');
 	}
 
-	private async call<T>(method: string, path: string, body?: unknown): Promise<T> {
+	/**
+	 * Kaneo allows a fixed number of requests per window for each API key (100 a
+	 * minute) and sends what is left. Calls go one at a time, and wait for the next
+	 * window when the budget is used, so a backfill never stalls on 429 backoff.
+	 */
+	private queue: Promise<unknown> = Promise.resolve();
+	private remaining = Infinity;
+	private resetAt = 0;
+
+	private call<T>(method: string, path: string, body?: unknown): Promise<T> {
+		const run = this.queue.then(() => this.send<T>(method, path, body));
+		this.queue = run.catch(() => undefined);
+		return run;
+	}
+
+	private async waitForBudget(): Promise<void> {
+		if (this.remaining > 1) return;
+		const wait = this.resetAt - Date.now();
+		if (wait > 0) await Bun.sleep(Math.min(wait + 500, 120_000));
+		this.remaining = Infinity;
+	}
+
+	private async send<T>(method: string, path: string, body?: unknown): Promise<T> {
 		let res: Response;
-		// Kaneo limits the request rate: wait and try again, up to four times.
 		for (let attempt = 0; ; attempt++) {
+			await this.waitForBudget();
 			res = await this.fetchFn(`${this.base}/api${path}`, {
 				method,
 				headers: {
@@ -70,9 +92,15 @@ export class Kaneo {
 				},
 				body: body !== undefined ? JSON.stringify(body) : undefined
 			});
+			const left = Number(res.headers.get('x-ratelimit-remaining'));
+			const reset = Number(res.headers.get('x-ratelimit-reset'));
+			if (res.headers.has('x-ratelimit-remaining') && Number.isFinite(left)) this.remaining = left;
+			if (reset > 0) this.resetAt = reset * 1000;
 			if (res.status !== 429 || attempt >= 4) break;
 			const after = Number(res.headers.get('retry-after'));
-			await Bun.sleep((after > 0 ? after : 2 ** attempt * 2) * 1000);
+			if (after > 0) this.resetAt = Math.max(this.resetAt, Date.now() + after * 1000);
+			else if (!(reset > 0)) this.resetAt = Date.now() + 2 ** attempt * 2000;
+			this.remaining = 0;
 		}
 		const text = await res.text();
 		if (!res.ok) throw new KaneoError(res.status, `Kaneo ${method} ${path}: ${res.status} ${text.slice(0, 300)}`);
@@ -92,8 +120,17 @@ export class Kaneo {
 		return this.call<KaneoProject[]>('GET', `/project?workspaceId=${encodeURIComponent(workspaceId)}`);
 	}
 
+	private projectCache = new Map<string, Promise<KaneoProject>>();
+
+	/** A project does not move between workspaces often: one read per run. */
 	project(id: string) {
-		return this.call<KaneoProject>('GET', `/project/${encodeURIComponent(id)}`);
+		let p = this.projectCache.get(id);
+		if (!p) {
+			p = this.call<KaneoProject>('GET', `/project/${encodeURIComponent(id)}`);
+			p.catch(() => this.projectCache.delete(id));
+			this.projectCache.set(id, p);
+		}
+		return p;
 	}
 
 	columns(projectId: string) {

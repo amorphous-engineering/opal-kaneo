@@ -108,6 +108,9 @@ export class Sync {
 				description: this.describe(issue.description, `/issues/${id}`),
 				label: issue.issueNumber
 			});
+			// A task made just now has nothing from Kaneo to read back.
+			await this.comments(row, true);
+			return;
 		}
 		await this.pullIssue(row, issue);
 		await this.pushIssue(row, await this.api.issues.get({ id }));
@@ -191,6 +194,8 @@ export class Sync {
 				description: this.describe(null, `/executions/${number}`),
 				label: number
 			});
+			await this.comments(row, true);
+			return;
 		}
 		// OPAL drives work order fields: a Kaneo edit is written back over.
 		const task = await this.kaneo.task(row.taskId);
@@ -252,7 +257,7 @@ export class Sync {
 	}
 
 	/** Copy new comments both ways. Comments this plugin wrote carry MARK and stay put. */
-	private async comments(row: TaskRow): Promise<void> {
+	private async comments(row: TaskRow, fresh = false): Promise<void> {
 		const opal: (IssueComment | ExecutionComment)[] =
 			row.kind === 'issue'
 				? await this.api.issues.listComments({ id: row.opalId })
@@ -267,6 +272,7 @@ export class Sync {
 			row.lastOpalComment = c.id;
 			this.save(row);
 		}
+		if (fresh) return;
 		for (const k of await this.kaneo.comments(row.taskId)) {
 			if (this.state.seen(row.taskId, k.id)) continue;
 			this.state.markSeen(row.taskId, k.id);

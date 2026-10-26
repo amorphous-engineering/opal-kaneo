@@ -1,7 +1,7 @@
 {
 	"id": "kaneo",
 	"name": "Kaneo",
-	"version": "0.3.1",
+	"version": "0.3.2",
 	"opal": ">=2.0.0-rc.16",
 	"main": "dist/plugin.js",
 	"summary": "Sync issues and work orders with Kaneo tasks.",

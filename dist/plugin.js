@@ -14924,7 +14924,7 @@ function definePlugin(def, opts = {}) {
     log(`route error ${c.req.method} ${c.req.path}:`, err);
     return c.json({ error: "internal", message: "Plugin error" }, 500);
   });
-  const server = Bun.serve({ hostname: "127.0.0.1", port, fetch: app.fetch });
+  const server = Bun.serve({ hostname: "127.0.0.1", port, idleTimeout: 120, fetch: app.fetch });
   const abort = new AbortController;
   let reconciling = false;
   async function reconcile() {
@@ -15145,9 +15145,28 @@ class Kaneo {
     this.fetchFn = fetchFn;
     this.base = url.replace(/\/+$/, "");
   }
-  async call(method, path, body) {
+  queue = Promise.resolve();
+  remaining = Infinity;
+  resetAt = 0;
+  call(method, path, body) {
+    const run = this.queue.then(() => this.send(method, path, body));
+    this.queue = run.catch(() => {
+      return;
+    });
+    return run;
+  }
+  async waitForBudget() {
+    if (this.remaining > 1)
+      return;
+    const wait = this.resetAt - Date.now();
+    if (wait > 0)
+      await Bun.sleep(Math.min(wait + 500, 120000));
+    this.remaining = Infinity;
+  }
+  async send(method, path, body) {
     let res;
     for (let attempt = 0;; attempt++) {
+      await this.waitForBudget();
       res = await this.fetchFn(`${this.base}/api${path}`, {
         method,
         headers: {
@@ -15156,10 +15175,20 @@ class Kaneo {
         },
         body: body !== undefined ? JSON.stringify(body) : undefined
       });
+      const left = Number(res.headers.get("x-ratelimit-remaining"));
+      const reset = Number(res.headers.get("x-ratelimit-reset"));
+      if (res.headers.has("x-ratelimit-remaining") && Number.isFinite(left))
+        this.remaining = left;
+      if (reset > 0)
+        this.resetAt = reset * 1000;
       if (res.status !== 429 || attempt >= 4)
         break;
       const after = Number(res.headers.get("retry-after"));
-      await Bun.sleep((after > 0 ? after : 2 ** attempt * 2) * 1000);
+      if (after > 0)
+        this.resetAt = Math.max(this.resetAt, Date.now() + after * 1000);
+      else if (!(reset > 0))
+        this.resetAt = Date.now() + 2 ** attempt * 2000;
+      this.remaining = 0;
     }
     const text = await res.text();
     if (!res.ok)
@@ -15175,8 +15204,15 @@ class Kaneo {
   projects(workspaceId) {
     return this.call("GET", `/project?workspaceId=${encodeURIComponent(workspaceId)}`);
   }
+  projectCache = new Map;
   project(id) {
-    return this.call("GET", `/project/${encodeURIComponent(id)}`);
+    let p = this.projectCache.get(id);
+    if (!p) {
+      p = this.call("GET", `/project/${encodeURIComponent(id)}`);
+      p.catch(() => this.projectCache.delete(id));
+      this.projectCache.set(id, p);
+    }
+    return p;
   }
   columns(projectId) {
     return this.call("GET", `/column/${encodeURIComponent(projectId)}`);
@@ -15375,6 +15411,8 @@ class Sync {
         description: this.describe(issue.description, `/issues/${id}`),
         label: issue.issueNumber
       });
+      await this.comments(row, true);
+      return;
     }
     await this.pullIssue(row, issue);
     await this.pushIssue(row, await this.api.issues.get({ id }));
@@ -15451,6 +15489,8 @@ class Sync {
         description: this.describe(null, `/executions/${number}`),
         label: number
       });
+      await this.comments(row, true);
+      return;
     }
     const task = await this.kaneo.task(row.taskId);
     row.pushed = { title: task.title, priority: task.priority, status: task.status };
@@ -15504,7 +15544,7 @@ class Sync {
     row.pushed = want;
     this.save(row);
   }
-  async comments(row) {
+  async comments(row, fresh = false) {
     const opal = row.kind === "issue" ? await this.api.issues.listComments({ id: row.opalId }) : await this.api.execution.listComments({ id: row.opalId });
     for (const c of opal) {
       if (c.id <= row.lastOpalComment)
@@ -15517,6 +15557,8 @@ class Sync {
       row.lastOpalComment = c.id;
       this.save(row);
     }
+    if (fresh)
+      return;
     for (const k of await this.kaneo.comments(row.taskId)) {
       if (this.state.seen(row.taskId, k.id))
         continue;
