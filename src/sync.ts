@@ -6,9 +6,9 @@
  * them on both sides). A side that differs from `pushed` changed since; OPAL wins
  * when both changed.
  */
-import type { Client, contracts, Issue, IssueComment, ExecutionComment } from '@opal/shared';
-import type { Kaneo, KaneoPriority, KaneoTask } from './kaneo.ts';
-import type { Kind, Pushed, State, TaskRow } from './state.ts';
+import type { Client, contracts, ExecutionComment, ExecutionRow, Issue, IssueComment } from '@opal/shared';
+import { KaneoError, type Kaneo, type KaneoPriority, type KaneoTask } from './kaneo.ts';
+import { emptyMeta, type Kind, type Pushed, type State, type TaskRow } from './state.ts';
 
 type Api = Client<typeof contracts>;
 
@@ -19,7 +19,7 @@ export interface Config {
 	workOrderProject: string | null;
 	issueColumns: Record<IssueState, string>;
 	workOrderColumns: Record<WoState, string>;
-	/** Base URL people use to open OPAL, for links in task descriptions. */
+	/** Base URL people use to open OPAL, for the resource link on each task. */
 	publicUrl: string | null;
 }
 
@@ -55,15 +55,39 @@ const TO_OPAL_PRIORITY: Partial<Record<KaneoPriority, Issue['priority']>> = {
 	urgent: 'critical'
 };
 
+/** Labels the plugin sets. A template number (T-0003) gets the grey default. */
+export const LABELS = { held: 'Held', issues: 'Issues', execution: 'Execution' } as const;
+const LABEL_COLORS: Record<string, string> = { Held: '#ef4444', Issues: '#f59e0b', Execution: '#3b82f6' };
+const labelColor = (name: string) => LABEL_COLORS[name] ?? '#6b7280';
+
 /** First line of a comment the plugin writes. Comments with it are never copied back. */
 const MARK = /^\*\*[^*\n]+\*\* · (OPAL|Kaneo)\n/;
 const marked = (who: string, from: 'OPAL' | 'Kaneo', body: string) => `**${who}** · ${from}\n\n${body}`;
 
 const issueState = (i: Issue): IssueState => (i.status === 'void' ? 'void' : i.ticketState);
 
+/** Fields that only go from OPAL to Kaneo. */
+export interface Extras {
+	labels: string[];
+	/** The work order whose task this one is a subtask of. */
+	parentWo: number | null;
+	resource: { url: string; title: string } | null;
+	/** Null: the plugin does not manage the description. */
+	description: string | null;
+	due: string | null;
+}
+
+interface Want {
+	pushed: Pushed;
+	extras: Extras;
+}
+
 export class Sync {
 	/** One pass per record at a time: events, webhooks and the poll can overlap. */
 	private locks = new Map<string, Promise<unknown>>();
+	/** Template number of each work order. It does not change. */
+	private templates = new Map<number, string>();
+	private running: Promise<void> | null = null;
 
 	constructor(
 		private api: Api,
@@ -85,44 +109,119 @@ export class Sync {
 		return run;
 	}
 
-	private opalLink(path: string): string {
-		return this.config.publicUrl ? `${this.config.publicUrl.replace(/\/+$/, '')}${path}` : '';
+	private opalLink(path: string): string | null {
+		return this.config.publicUrl ? `${this.config.publicUrl.replace(/\/+$/, '')}${path}` : null;
+	}
+
+	private resource(path: string, number: string): Extras['resource'] {
+		const url = this.opalLink(path);
+		return url ? { url, title: `${number} in OPAL` } : null;
+	}
+
+	private async template(executionId: number): Promise<string | null> {
+		let t = this.templates.get(executionId);
+		if (!t) {
+			t = (await this.api.execution.get({ id: executionId })).procedureNumber;
+			this.templates.set(executionId, t);
+		}
+		return t;
+	}
+
+	issueWant(i: Issue, template: string | null): Want {
+		return {
+			pushed: {
+				title: `${i.issueNumber} ${i.title}`,
+				priority: TO_KANEO_PRIORITY[i.priority] ?? 'medium',
+				status: this.config.issueColumns[issueState(i)]
+			},
+			extras: {
+				labels: i.executionId ? [LABELS.execution, ...(template ? [template] : [])] : [],
+				parentWo: this.config.workOrderProject ? i.executionId : null,
+				resource: this.resource(`/issues/${i.id}`, i.issueNumber),
+				description: i.description ?? '',
+				due: null
+			}
+		};
+	}
+
+	woWant(w: ExecutionRow, openIssues: number): Want {
+		return {
+			pushed: {
+				title: `${w.woNumber} ${w.procedureName}`,
+				priority: TO_KANEO_PRIORITY[w.priority] ?? 'medium',
+				status: this.config.workOrderColumns[w.status]
+			},
+			extras: {
+				labels: [...(w.heldBy.length ? [LABELS.held] : []), ...(openIssues ? [LABELS.issues] : [])],
+				parentWo: null,
+				resource: this.resource(`/executions/${w.id}`, w.woNumber),
+				description: null,
+				due: w.targetCompletionAt ? w.targetCompletionAt.slice(0, 10) : null
+			}
+		};
+	}
+
+	/** The task, or null when it is gone from Kaneo. */
+	private async readTask(row: TaskRow): Promise<KaneoTask | null> {
+		try {
+			return await this.kaneo.task(row.taskId);
+		} catch (e) {
+			if (e instanceof KaneoError && e.status === 404) return null;
+			throw e;
+		}
+	}
+
+	/** A task deleted in Kaneo: drop it here, so the record gets a new task. OPAL is the source. */
+	private async forget(row: TaskRow): Promise<void> {
+		this.state.drop(row.kind, row.opalId);
+		await this.api.plugins.links.remove({
+			entityType: row.kind === 'issue' ? 'issue' : 'execution',
+			entityId: row.opalId,
+			externalId: row.taskId
+		});
+		this.log(`task ${row.taskId} is gone from Kaneo: ${row.kind} ${row.opalId} gets a new one`);
 	}
 
 	// ------------------------------------------------------------------ issues
 
-	issue(id: number): Promise<void> {
-		return this.locked(`issue:${id}`, () => this.issuePass(id));
+	/** `fromPoll`: the poll syncs work orders itself, so the issue does not start one. */
+	issue(id: number, fromPoll = false): Promise<void> {
+		return this.locked(`issue:${id}`, () => this.issuePass(id, fromPoll));
 	}
 
-	private async issuePass(id: number): Promise<void> {
+	private async issuePass(id: number, fromPoll: boolean): Promise<void> {
 		const issue = await this.api.issues.get({ id });
 		const projectId = this.config.issueProject;
+		const template = issue.executionId ? await this.template(issue.executionId) : null;
 		let row = this.state.get('issue', id);
-		if (!row) {
+		const task = row ? await this.readTask(row) : null;
+		if (row && !task) {
+			await this.forget(row);
+			row = undefined;
+		}
+		if (!row || !task) {
 			if (!projectId || issue.status === 'void') return;
-			row = await this.createTask('issue', id, projectId, {
-				title: `${issue.issueNumber} ${issue.title}`,
-				priority: TO_KANEO_PRIORITY[issue.priority] ?? 'medium',
-				status: this.config.issueColumns[issueState(issue)],
-				description: this.describe(issue.description, `/issues/${id}`),
-				label: issue.issueNumber
-			});
+			const want = this.issueWant(issue, template);
+			row = await this.createTask('issue', id, projectId, want, issue.issueNumber);
 			// A task made just now has nothing from Kaneo to read back.
 			await this.comments(row, true);
-			return;
+			await this.extras(row, want.extras);
+		} else {
+			await this.pullIssue(row, issue, task);
+			const want = this.issueWant(await this.api.issues.get({ id }), template);
+			await this.push(row, want.pushed);
+			await this.extras(row, want.extras);
+			await this.comments(row);
 		}
-		await this.pullIssue(row, issue);
-		await this.pushIssue(row, await this.api.issues.get({ id }));
-		await this.comments(row);
+		// The work order's Issues label counts this issue.
+		if (!fromPoll && issue.executionId && this.config.workOrderProject) await this.workOrder(issue.executionId);
 	}
 
 	/**
 	 * Apply Kaneo changes to OPAL. Afterwards `pushed` holds what Kaneo shows now,
 	 * so the push writes back every value OPAL did not take.
 	 */
-	private async pullIssue(row: TaskRow, issue: Issue): Promise<void> {
-		const task = await this.kaneo.task(row.taskId);
+	private async pullIssue(row: TaskRow, issue: Issue, task: KaneoTask): Promise<void> {
 		const prefix = `${issue.issueNumber} `;
 		if (task.title !== row.pushed.title) {
 			const title = task.title.startsWith(prefix) ? task.title.slice(prefix.length).trim() : task.title.trim();
@@ -161,68 +260,47 @@ export class Sync {
 		}
 	}
 
-	/** Write OPAL's values to Kaneo where they differ from what Kaneo has. */
-	private async pushIssue(row: TaskRow, issue: Issue): Promise<void> {
-		const want: Pushed = {
-			title: `${issue.issueNumber} ${issue.title}`,
-			priority: TO_KANEO_PRIORITY[issue.priority] ?? 'medium',
-			status: this.config.issueColumns[issueState(issue)]
-		};
-		await this.push(row, want);
-	}
-
 	// -------------------------------------------------------------- work orders
 
 	workOrder(id: number): Promise<void> {
 		return this.locked(`wo:${id}`, () => this.woPass(id));
 	}
 
-	private async woPass(id: number): Promise<void> {
+	private async woPass(id: number, open?: number): Promise<void> {
 		const wo = await this.api.execution.get({ id });
+		this.templates.set(id, wo.procedureNumber);
+		const openIssues = open ?? (await this.api.issues.list({ executionId: id, status: 'open', limit: 1 })).total;
+		const want = this.woWant(wo, openIssues);
 		const projectId = this.config.workOrderProject;
-		const number = wo.woNumber;
-		const want: Pushed = {
-			title: `${number} ${wo.procedureName}`,
-			priority: TO_KANEO_PRIORITY[wo.priority] ?? 'medium',
-			status: this.config.workOrderColumns[wo.status]
-		};
 		let row = this.state.get('wo', id);
-		if (!row) {
-			if (!projectId) return;
-			row = await this.createTask('wo', id, projectId, {
-				...want,
-				description: this.describe(null, `/executions/${number}`),
-				label: number
-			});
-			await this.comments(row, true);
-			return;
+		const task = row ? await this.readTask(row) : null;
+		if (row && !task) {
+			await this.forget(row);
+			row = undefined;
 		}
-		// OPAL drives work order fields: a Kaneo edit is written back over.
-		const task = await this.kaneo.task(row.taskId);
-		row.pushed = { title: task.title, priority: task.priority, status: task.status };
-		await this.push(row, want);
-		await this.comments(row);
+		if (!row || !task) {
+			if (!projectId) return;
+			row = await this.createTask('wo', id, projectId, want, wo.woNumber);
+			await this.comments(row, true);
+		} else {
+			// OPAL drives work order fields: a Kaneo edit is written back over.
+			row.pushed = { title: task.title, priority: task.priority, status: task.status };
+			await this.push(row, want.pushed);
+			await this.comments(row);
+		}
+		await this.extras(row, want.extras);
 	}
 
 	// ----------------------------------------------------------------- shared
 
-	private describe(body: string | null, path: string): string {
-		const link = this.opalLink(path);
-		return [body ?? '', link ? `[Open in OPAL](${link})` : ''].filter(Boolean).join('\n\n');
-	}
-
-	private async createTask(
-		kind: Kind,
-		opalId: number,
-		projectId: string,
-		t: Pushed & { description: string; label: string }
-	): Promise<TaskRow> {
+	private async createTask(kind: Kind, opalId: number, projectId: string, want: Want, number: string): Promise<TaskRow> {
 		const project = await this.kaneo.project(projectId);
+		const description = want.extras.description ?? '';
 		const task = await this.kaneo.createTask(projectId, {
-			title: t.title,
-			description: t.description,
-			priority: t.priority as KaneoPriority,
-			status: t.status
+			title: want.pushed.title,
+			description,
+			priority: want.pushed.priority as KaneoPriority,
+			status: want.pushed.status
 		});
 		const url = this.kaneo.taskUrl(task, project.workspaceId);
 		const row: TaskRow = {
@@ -234,7 +312,8 @@ export class Sync {
 			url,
 			pushed: { title: task.title, priority: task.priority, status: task.status },
 			lastOpalComment: 0,
-			syncedAt: new Date().toISOString()
+			syncedAt: new Date().toISOString(),
+			meta: { ...emptyMeta(), description: want.extras.description === null ? null : description }
 		};
 		this.save(row);
 		await this.api.plugins.links.set({
@@ -244,7 +323,7 @@ export class Sync {
 			url,
 			label: task.number != null ? `${project.slug}-${task.number}` : project.name
 		});
-		this.log(`created task ${task.id} for ${kind} ${t.label}`);
+		this.log(`created task ${task.id} for ${kind} ${number}`);
 		return row;
 	}
 
@@ -254,6 +333,63 @@ export class Sync {
 		if (want.status !== row.pushed.status) await this.kaneo.setStatus(row.taskId, want.status);
 		row.pushed = want;
 		this.save(row);
+	}
+
+	/** Kaneo task of a work order, made first when it has none. */
+	private async woTask(id: number): Promise<string | null> {
+		const have = this.state.get('wo', id);
+		if (have) return have.taskId;
+		await this.workOrder(id);
+		return this.state.get('wo', id)?.taskId ?? null;
+	}
+
+	/** Write the one-way fields that differ from what the plugin last wrote. */
+	private async extras(row: TaskRow, e: Extras): Promise<void> {
+		const m = row.meta;
+		for (const name of e.labels) {
+			if (m.labels[name]) continue;
+			m.labels[name] = (await this.kaneo.addLabel(row.workspaceId, row.taskId, name, labelColor(name))).id;
+			this.save(row);
+		}
+		for (const [name, id] of Object.entries(m.labels)) {
+			if (e.labels.includes(name)) continue;
+			await gone(this.kaneo.deleteLabel(id));
+			delete m.labels[name];
+			this.save(row);
+		}
+		const parent = e.parentWo ? await this.woTask(e.parentWo) : null;
+		if ((m.parent?.taskId ?? null) !== parent) {
+			if (m.parent) await gone(this.kaneo.deleteRelation(m.parent.relationId));
+			m.parent = parent ? { taskId: parent, relationId: (await this.kaneo.addSubtask(parent, row.taskId)).id } : null;
+			this.save(row);
+		}
+		if (e.resource && m.resource !== e.resource.url) {
+			await this.kaneo.addResource(row.taskId, e.resource.url, e.resource.title);
+			m.resource = e.resource.url;
+			this.save(row);
+		}
+		if (e.description !== null && m.description !== e.description) {
+			await this.kaneo.setDescription(row.taskId, e.description);
+			m.description = e.description;
+			this.save(row);
+		}
+		if (e.due && m.due !== e.due) {
+			await this.kaneo.setDueDate(row.taskId, e.due);
+			m.due = e.due;
+			this.save(row);
+		}
+	}
+
+	/** True when the one-way fields differ from what the plugin last wrote. */
+	private extrasStale(row: TaskRow, e: Extras): boolean {
+		const m = row.meta;
+		const labels = Object.keys(m.labels);
+		if (labels.length !== e.labels.length || e.labels.some((l) => !m.labels[l])) return true;
+		const parent = e.parentWo ? (this.state.get('wo', e.parentWo)?.taskId ?? 'missing') : null;
+		if ((m.parent?.taskId ?? null) !== parent) return true;
+		if (e.resource && m.resource !== e.resource.url) return true;
+		if (e.description !== null && m.description !== e.description) return true;
+		return !!e.due && m.due !== e.due;
 	}
 
 	/** Copy new comments both ways. Comments this plugin wrote carry MARK and stay put. */
@@ -300,15 +436,28 @@ export class Sync {
 		await (row.kind === 'issue' ? this.issue(row.opalId) : this.workOrder(row.opalId));
 	}
 
-	/** Start of the previous poll. Null: the first poll after start does a full pass. */
+	/** Start of the previous poll. Null: the next poll does a full pass. */
 	private lastPoll: string | null = null;
 
 	/**
 	 * Every issue and work order. New records get a task. A record gets a pass
 	 * only when OPAL, the Kaneo board or Kaneo comments changed, so a poll costs
-	 * a few Kaneo calls, not some for each task.
+	 * a few Kaneo calls, not some for each task. `full` passes every record.
+	 * A poll that starts while one runs waits for it.
 	 */
-	async all(): Promise<void> {
+	all(full = false): Promise<void> {
+		if (this.running) return this.running;
+		if (full) this.lastPoll = null;
+		this.running = this.poll().finally(() => (this.running = null));
+		return this.running;
+	}
+
+	/** True while a poll or a full sync runs. */
+	get busy(): boolean {
+		return this.running !== null;
+	}
+
+	private async poll(): Promise<void> {
 		const since = this.lastPoll;
 		this.lastPoll = new Date().toISOString();
 		const kaneoIds = new Set([this.config.issueProject, this.config.workOrderProject].filter((p): p is string => !!p));
@@ -324,40 +473,51 @@ export class Sync {
 				for (const a of await this.kaneo.activity(ws))
 					if (a.type === 'comment' && a.createdAt > since) commented.add(a.taskId);
 
-		const stale = (row: TaskRow | undefined, want: Pushed) => {
-			if (!row || !since) return true;
+		const stale = (row: TaskRow, want: Want) => {
+			if (!since) return true;
 			const t = board.get(row.taskId);
+			// Gone from its board: the pass sees the 404 and makes a new task.
+			if (!t && kaneoIds.has(row.projectId)) return true;
 			const same = (a: Pushed, b: Pushed) => a.title === b.title && a.priority === b.priority && a.status === b.status;
-			return commented.has(row.taskId) || !same(want, row.pushed) || (t !== undefined && !same(t, row.pushed));
+			return (
+				commented.has(row.taskId) ||
+				!same(want.pushed, row.pushed) ||
+				(t !== undefined && !same(t, row.pushed)) ||
+				this.extrasStale(row, want.extras)
+			);
 		};
 
+		// OPAL lists first: work order labels count open issues, issue labels name templates.
+		const wos: ExecutionRow[] = [];
+		for await (const w of pages((cursor) => this.api.execution.list({ cursor, limit: 200 }))) wos.push(w);
+		const issues: Issue[] = [];
+		for await (const i of pages((cursor) => this.api.issues.list({ cursor, limit: 200 }))) issues.push(i);
+		for (const w of wos) this.templates.set(w.id, w.procedureNumber);
+		const open = new Map<number, number>();
+		for (const i of issues)
+			if (i.status === 'open' && i.executionId) open.set(i.executionId, (open.get(i.executionId) ?? 0) + 1);
+
 		let synced = 0;
-		if (this.config.issueProject)
-			for await (const i of pages((cursor) => this.api.issues.list({ cursor, limit: 200 }))) {
-				const row = this.state.get('issue', i.id);
-				const want: Pushed = {
-					title: `${i.issueNumber} ${i.title}`,
-					priority: TO_KANEO_PRIORITY[i.priority] ?? 'medium',
-					status: this.config.issueColumns[issueState(i)]
-				};
-				if (row ? stale(row, want) : i.status !== 'void') {
-					synced++;
-					await this.guard(`issue ${i.issueNumber}`, () => this.issue(i.id));
-				}
-			}
+		// Work orders first, so issues find their parent task.
 		if (this.config.workOrderProject)
-			for await (const w of pages((cursor) => this.api.execution.list({ cursor, limit: 200 }))) {
-				const want: Pushed = {
-					title: `${w.woNumber} ${w.procedureName}`,
-					priority: TO_KANEO_PRIORITY[w.priority] ?? 'medium',
-					status: this.config.workOrderColumns[w.status]
-				};
-				if (stale(this.state.get('wo', w.id), want)) {
-					synced++;
-					await this.guard(`work order ${w.woNumber}`, () => this.workOrder(w.id));
-				}
+			for (const w of wos) {
+				const row = this.state.get('wo', w.id);
+				const want = this.woWant(w, open.get(w.id) ?? 0);
+				if (row && !stale(row, want)) continue;
+				synced++;
+				await this.guard(`work order ${w.woNumber}`, () =>
+					this.locked(`wo:${w.id}`, () => this.woPass(w.id, open.get(w.id) ?? 0))
+				);
 			}
-		this.log(`poll: ${synced} synced, ${board.size} Kaneo tasks read`);
+		if (this.config.issueProject)
+			for (const i of issues) {
+				const row = this.state.get('issue', i.id);
+				const want = this.issueWant(i, i.executionId ? (this.templates.get(i.executionId) ?? null) : null);
+				if (row ? !stale(row, want) : i.status === 'void') continue;
+				synced++;
+				await this.guard(`issue ${i.issueNumber}`, () => this.issue(i.id, true));
+			}
+		this.log(`${since ? 'poll' : 'full sync'}: ${synced} synced, ${board.size} Kaneo tasks read`);
 	}
 
 	async guard(what: string, fn: () => Promise<void>): Promise<void> {
@@ -366,6 +526,15 @@ export class Sync {
 		} catch (e) {
 			this.log(`${what}: ${(e as Error).message}`);
 		}
+	}
+}
+
+/** Delete calls: a thing already gone is fine. */
+async function gone(p: Promise<unknown>): Promise<void> {
+	try {
+		await p;
+	} catch (e) {
+		if (!(e instanceof KaneoError && e.status === 404)) throw e;
 	}
 }
 

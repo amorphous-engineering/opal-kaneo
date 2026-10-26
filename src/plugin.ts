@@ -62,6 +62,7 @@ export default definePlugin({
 		state = new State(ctx.dataDir);
 		const me = await ctx.api.auth.me({});
 		sync = new Sync(ctx.api, kaneo, state, config, me.id, ctx.log);
+		if (!config.publicUrl) ctx.log('OPAL public URL is not set: tasks get no OPAL link');
 		await registerWebhooks(ctx, config);
 	},
 
@@ -107,6 +108,7 @@ export default definePlugin({
 						<tr><th>Task</th><td><a class="mono" href="${row.url}" target="_blank" rel="noopener">${row.pushed.title}</a></td></tr>
 						<tr><th>Column</th><td class="mono">${row.pushed.status}</td></tr>
 						<tr><th>Priority</th><td class="mono">${row.pushed.priority}</td></tr>
+						<tr><th>Labels</th><td>${Object.keys(row.meta.labels).map((l) => html`<span class="badge">${l}</span> `)}</td></tr>
 						<tr><th>Synced</th><td class="mono">${row.syncedAt.slice(0, 16).replace('T', ' ')} UTC</td></tr>
 					</table>
 					<p><button id="sync">SYNC</button></p>`
@@ -143,6 +145,14 @@ export default definePlugin({
 				}
 			}
 			return c.json({ items: cached.items });
+		});
+
+		// The SYNC button on the OPAL plugin page: a full pass in the background.
+		app.post('/actions/sync', (c) => {
+			if (!sync) return c.json({ error: 'not_started', message: 'The plugin is still starting' }, 503);
+			if (sync.busy) return c.json({ message: 'A sync is already running' });
+			void sync.guard('full sync', () => sync!.all(true));
+			return c.json({ message: 'Full sync started' });
 		});
 
 		app.post('/sync', async (c) => {

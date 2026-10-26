@@ -184,6 +184,36 @@ export class Kaneo {
 		);
 	}
 
+	/** Make a label on one task (Kaneo labels belong to a single task). */
+	addLabel(workspaceId: string, taskId: string, name: string, color: string) {
+		return this.call<{ id: string }>('POST', '/label', { name, color, workspaceId, taskId });
+	}
+
+	deleteLabel(id: string) {
+		return this.call<unknown>('DELETE', `/label/${encodeURIComponent(id)}`);
+	}
+
+	/** `parent` gets `child` as a subtask. */
+	addSubtask(parent: string, child: string) {
+		return this.call<{ id: string }>('POST', '/task-relation', {
+			sourceTaskId: parent,
+			targetTaskId: child,
+			relationType: 'subtask'
+		});
+	}
+
+	deleteRelation(id: string) {
+		return this.call<unknown>('DELETE', `/task-relation/${encodeURIComponent(id)}`);
+	}
+
+	addResource(taskId: string, url: string, title: string) {
+		return this.call<{ id: string }>('POST', `/external-link/task/${encodeURIComponent(taskId)}`, { url, title });
+	}
+
+	setDueDate(id: string, dueDate: string) {
+		return this.call<KaneoTask>('PUT', `/task/due-date/${encodeURIComponent(id)}`, { dueDate });
+	}
+
 	comments(taskId: string) {
 		return this.call<KaneoComment[]>('GET', `/comment/${encodeURIComponent(taskId)}`);
 	}

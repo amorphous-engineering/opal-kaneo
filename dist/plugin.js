@@ -11074,6 +11074,10 @@ var zPluginPanelDef = strictObject({
   title: string2().min(1).max(40),
   path: string2().regex(/^\/[^\s?#]*$/).max(200)
 });
+var zPluginActionDef = strictObject({
+  label: string2().min(1).max(30),
+  path: string2().regex(/^\/[^\s?#]*$/).max(200)
+});
 var zPluginManifest = strictObject({
   id: string2().regex(/^[a-z0-9]+(-[a-z0-9]+)*$/, "Lowercase letters, digits and hyphens").max(40),
   name: string2().min(1).max(60),
@@ -11088,7 +11092,8 @@ var zPluginManifest = strictObject({
     hooks: boolean2().default(false)
   }).default({ ops: [], events: [], hooks: false }),
   settings: array(zPluginSettingDef).max(50).default([]),
-  panels: array(zPluginPanelDef).max(10).default([])
+  panels: array(zPluginPanelDef).max(10).default([]),
+  actions: array(zPluginActionDef).max(10).default([])
 });
 var PLUGIN_PROCESS_STATES = ["stopped", "starting", "running", "crashed"];
 var zPluginProcess = object({
@@ -15249,6 +15254,28 @@ class Kaneo {
   activity(workspaceId) {
     return this.call("GET", `/activity/workspace/${encodeURIComponent(workspaceId)}`);
   }
+  addLabel(workspaceId, taskId, name, color) {
+    return this.call("POST", "/label", { name, color, workspaceId, taskId });
+  }
+  deleteLabel(id) {
+    return this.call("DELETE", `/label/${encodeURIComponent(id)}`);
+  }
+  addSubtask(parent, child) {
+    return this.call("POST", "/task-relation", {
+      sourceTaskId: parent,
+      targetTaskId: child,
+      relationType: "subtask"
+    });
+  }
+  deleteRelation(id) {
+    return this.call("DELETE", `/task-relation/${encodeURIComponent(id)}`);
+  }
+  addResource(taskId, url, title) {
+    return this.call("POST", `/external-link/task/${encodeURIComponent(taskId)}`, { url, title });
+  }
+  setDueDate(id, dueDate) {
+    return this.call("PUT", `/task/due-date/${encodeURIComponent(id)}`, { dueDate });
+  }
   comments(taskId) {
     return this.call("GET", `/comment/${encodeURIComponent(taskId)}`);
   }
@@ -15273,6 +15300,7 @@ class Kaneo {
 // src/state.ts
 import { Database } from "bun:sqlite";
 import { join } from "path";
+var emptyMeta = () => ({ labels: {}, parent: null, resource: null, description: null, due: null });
 var fromRaw = (r) => ({
   kind: r.kind,
   opalId: r.opal_id,
@@ -15282,7 +15310,8 @@ var fromRaw = (r) => ({
   url: r.url,
   pushed: JSON.parse(r.pushed),
   lastOpalComment: r.last_opal_comment,
-  syncedAt: r.synced_at
+  syncedAt: r.synced_at,
+  meta: { ...emptyMeta(), ...r.meta ? JSON.parse(r.meta) : {} }
 });
 
 class State {
@@ -15295,6 +15324,9 @@ class State {
 			project_id TEXT NOT NULL, workspace_id TEXT NOT NULL, url TEXT NOT NULL,
 			pushed TEXT NOT NULL, last_opal_comment INTEGER NOT NULL DEFAULT 0, synced_at TEXT NOT NULL,
 			PRIMARY KEY (kind, opal_id))`);
+    const cols = this.db.query("PRAGMA table_info(task)").all();
+    if (!cols.some((c) => c.name === "meta"))
+      this.db.run("ALTER TABLE task ADD COLUMN meta TEXT");
     this.db.run(`CREATE TABLE IF NOT EXISTS seen_comment (
 			task_id TEXT NOT NULL, comment_id TEXT NOT NULL, PRIMARY KEY (task_id, comment_id))`);
   }
@@ -15311,11 +15343,11 @@ class State {
     return rows.map(fromRaw);
   }
   save(row) {
-    this.db.query(`INSERT INTO task (kind, opal_id, task_id, project_id, workspace_id, url, pushed, last_opal_comment, synced_at)
-				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    this.db.query(`INSERT INTO task (kind, opal_id, task_id, project_id, workspace_id, url, pushed, last_opal_comment, synced_at, meta)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 				 ON CONFLICT (kind, opal_id) DO UPDATE SET task_id = excluded.task_id, project_id = excluded.project_id,
 				 workspace_id = excluded.workspace_id, url = excluded.url, pushed = excluded.pushed,
-				 last_opal_comment = excluded.last_opal_comment, synced_at = excluded.synced_at`).run(row.kind, row.opalId, row.taskId, row.projectId, row.workspaceId, row.url, JSON.stringify(row.pushed), row.lastOpalComment, row.syncedAt);
+				 last_opal_comment = excluded.last_opal_comment, synced_at = excluded.synced_at, meta = excluded.meta`).run(row.kind, row.opalId, row.taskId, row.projectId, row.workspaceId, row.url, JSON.stringify(row.pushed), row.lastOpalComment, row.syncedAt, JSON.stringify(row.meta));
   }
   drop(kind, opalId) {
     this.db.query("DELETE FROM task WHERE kind = ? AND opal_id = ?").run(kind, opalId);
@@ -15356,6 +15388,9 @@ var TO_OPAL_PRIORITY = {
   high: "high",
   urgent: "critical"
 };
+var LABELS = { held: "Held", issues: "Issues", execution: "Execution" };
+var LABEL_COLORS = { Held: "#ef4444", Issues: "#f59e0b", Execution: "#3b82f6" };
+var labelColor = (name) => LABEL_COLORS[name] ?? "#6b7280";
 var MARK = /^\*\*[^*\n]+\*\* \u00B7 (OPAL|Kaneo)\n/;
 var marked = (who, from, body) => `**${who}** \xB7 ${from}
 
@@ -15370,6 +15405,8 @@ class Sync {
   pluginUserId;
   log;
   locks = new Map;
+  templates = new Map;
+  running = null;
   constructor(api, kaneo, state, config, pluginUserId, log) {
     this.api = api;
     this.kaneo = kaneo;
@@ -15392,34 +15429,101 @@ class Sync {
     return run;
   }
   opalLink(path) {
-    return this.config.publicUrl ? `${this.config.publicUrl.replace(/\/+$/, "")}${path}` : "";
+    return this.config.publicUrl ? `${this.config.publicUrl.replace(/\/+$/, "")}${path}` : null;
   }
-  issue(id) {
-    return this.locked(`issue:${id}`, () => this.issuePass(id));
+  resource(path, number) {
+    const url = this.opalLink(path);
+    return url ? { url, title: `${number} in OPAL` } : null;
   }
-  async issuePass(id) {
+  async template(executionId) {
+    let t = this.templates.get(executionId);
+    if (!t) {
+      t = (await this.api.execution.get({ id: executionId })).procedureNumber;
+      this.templates.set(executionId, t);
+    }
+    return t;
+  }
+  issueWant(i, template) {
+    return {
+      pushed: {
+        title: `${i.issueNumber} ${i.title}`,
+        priority: TO_KANEO_PRIORITY[i.priority] ?? "medium",
+        status: this.config.issueColumns[issueState(i)]
+      },
+      extras: {
+        labels: i.executionId ? [LABELS.execution, ...template ? [template] : []] : [],
+        parentWo: this.config.workOrderProject ? i.executionId : null,
+        resource: this.resource(`/issues/${i.id}`, i.issueNumber),
+        description: i.description ?? "",
+        due: null
+      }
+    };
+  }
+  woWant(w, openIssues) {
+    return {
+      pushed: {
+        title: `${w.woNumber} ${w.procedureName}`,
+        priority: TO_KANEO_PRIORITY[w.priority] ?? "medium",
+        status: this.config.workOrderColumns[w.status]
+      },
+      extras: {
+        labels: [...w.heldBy.length ? [LABELS.held] : [], ...openIssues ? [LABELS.issues] : []],
+        parentWo: null,
+        resource: this.resource(`/executions/${w.id}`, w.woNumber),
+        description: null,
+        due: w.targetCompletionAt ? w.targetCompletionAt.slice(0, 10) : null
+      }
+    };
+  }
+  async readTask(row) {
+    try {
+      return await this.kaneo.task(row.taskId);
+    } catch (e) {
+      if (e instanceof KaneoError && e.status === 404)
+        return null;
+      throw e;
+    }
+  }
+  async forget(row) {
+    this.state.drop(row.kind, row.opalId);
+    await this.api.plugins.links.remove({
+      entityType: row.kind === "issue" ? "issue" : "execution",
+      entityId: row.opalId,
+      externalId: row.taskId
+    });
+    this.log(`task ${row.taskId} is gone from Kaneo: ${row.kind} ${row.opalId} gets a new one`);
+  }
+  issue(id, fromPoll = false) {
+    return this.locked(`issue:${id}`, () => this.issuePass(id, fromPoll));
+  }
+  async issuePass(id, fromPoll) {
     const issue = await this.api.issues.get({ id });
     const projectId = this.config.issueProject;
+    const template = issue.executionId ? await this.template(issue.executionId) : null;
     let row = this.state.get("issue", id);
-    if (!row) {
+    const task = row ? await this.readTask(row) : null;
+    if (row && !task) {
+      await this.forget(row);
+      row = undefined;
+    }
+    if (!row || !task) {
       if (!projectId || issue.status === "void")
         return;
-      row = await this.createTask("issue", id, projectId, {
-        title: `${issue.issueNumber} ${issue.title}`,
-        priority: TO_KANEO_PRIORITY[issue.priority] ?? "medium",
-        status: this.config.issueColumns[issueState(issue)],
-        description: this.describe(issue.description, `/issues/${id}`),
-        label: issue.issueNumber
-      });
+      const want = this.issueWant(issue, template);
+      row = await this.createTask("issue", id, projectId, want, issue.issueNumber);
       await this.comments(row, true);
-      return;
+      await this.extras(row, want.extras);
+    } else {
+      await this.pullIssue(row, issue, task);
+      const want = this.issueWant(await this.api.issues.get({ id }), template);
+      await this.push(row, want.pushed);
+      await this.extras(row, want.extras);
+      await this.comments(row);
     }
-    await this.pullIssue(row, issue);
-    await this.pushIssue(row, await this.api.issues.get({ id }));
-    await this.comments(row);
+    if (!fromPoll && issue.executionId && this.config.workOrderProject)
+      await this.workOrder(issue.executionId);
   }
-  async pullIssue(row, issue) {
-    const task = await this.kaneo.task(row.taskId);
+  async pullIssue(row, issue, task) {
     const prefix = `${issue.issueNumber} `;
     if (task.title !== row.pushed.title) {
       const title = task.title.startsWith(prefix) ? task.title.slice(prefix.length).trim() : task.title.trim();
@@ -15460,56 +15564,41 @@ class Sync {
       return `${issue.issueNumber} did not move: ${e.message}`;
     }
   }
-  async pushIssue(row, issue) {
-    const want = {
-      title: `${issue.issueNumber} ${issue.title}`,
-      priority: TO_KANEO_PRIORITY[issue.priority] ?? "medium",
-      status: this.config.issueColumns[issueState(issue)]
-    };
-    await this.push(row, want);
-  }
   workOrder(id) {
     return this.locked(`wo:${id}`, () => this.woPass(id));
   }
-  async woPass(id) {
+  async woPass(id, open) {
     const wo = await this.api.execution.get({ id });
+    this.templates.set(id, wo.procedureNumber);
+    const openIssues = open ?? (await this.api.issues.list({ executionId: id, status: "open", limit: 1 })).total;
+    const want = this.woWant(wo, openIssues);
     const projectId = this.config.workOrderProject;
-    const number = wo.woNumber;
-    const want = {
-      title: `${number} ${wo.procedureName}`,
-      priority: TO_KANEO_PRIORITY[wo.priority] ?? "medium",
-      status: this.config.workOrderColumns[wo.status]
-    };
     let row = this.state.get("wo", id);
-    if (!row) {
+    const task = row ? await this.readTask(row) : null;
+    if (row && !task) {
+      await this.forget(row);
+      row = undefined;
+    }
+    if (!row || !task) {
       if (!projectId)
         return;
-      row = await this.createTask("wo", id, projectId, {
-        ...want,
-        description: this.describe(null, `/executions/${number}`),
-        label: number
-      });
+      row = await this.createTask("wo", id, projectId, want, wo.woNumber);
       await this.comments(row, true);
-      return;
+    } else {
+      row.pushed = { title: task.title, priority: task.priority, status: task.status };
+      await this.push(row, want.pushed);
+      await this.comments(row);
     }
-    const task = await this.kaneo.task(row.taskId);
-    row.pushed = { title: task.title, priority: task.priority, status: task.status };
-    await this.push(row, want);
-    await this.comments(row);
+    await this.extras(row, want.extras);
   }
-  describe(body, path) {
-    const link = this.opalLink(path);
-    return [body ?? "", link ? `[Open in OPAL](${link})` : ""].filter(Boolean).join(`
-
-`);
-  }
-  async createTask(kind, opalId, projectId, t) {
+  async createTask(kind, opalId, projectId, want, number) {
     const project = await this.kaneo.project(projectId);
+    const description = want.extras.description ?? "";
     const task = await this.kaneo.createTask(projectId, {
-      title: t.title,
-      description: t.description,
-      priority: t.priority,
-      status: t.status
+      title: want.pushed.title,
+      description,
+      priority: want.pushed.priority,
+      status: want.pushed.status
     });
     const url = this.kaneo.taskUrl(task, project.workspaceId);
     const row = {
@@ -15521,7 +15610,8 @@ class Sync {
       url,
       pushed: { title: task.title, priority: task.priority, status: task.status },
       lastOpalComment: 0,
-      syncedAt: new Date().toISOString()
+      syncedAt: new Date().toISOString(),
+      meta: { ...emptyMeta(), description: want.extras.description === null ? null : description }
     };
     this.save(row);
     await this.api.plugins.links.set({
@@ -15531,7 +15621,7 @@ class Sync {
       url,
       label: task.number != null ? `${project.slug}-${task.number}` : project.name
     });
-    this.log(`created task ${task.id} for ${kind} ${t.label}`);
+    this.log(`created task ${task.id} for ${kind} ${number}`);
     return row;
   }
   async push(row, want) {
@@ -15543,6 +15633,65 @@ class Sync {
       await this.kaneo.setStatus(row.taskId, want.status);
     row.pushed = want;
     this.save(row);
+  }
+  async woTask(id) {
+    const have = this.state.get("wo", id);
+    if (have)
+      return have.taskId;
+    await this.workOrder(id);
+    return this.state.get("wo", id)?.taskId ?? null;
+  }
+  async extras(row, e) {
+    const m = row.meta;
+    for (const name of e.labels) {
+      if (m.labels[name])
+        continue;
+      m.labels[name] = (await this.kaneo.addLabel(row.workspaceId, row.taskId, name, labelColor(name))).id;
+      this.save(row);
+    }
+    for (const [name, id] of Object.entries(m.labels)) {
+      if (e.labels.includes(name))
+        continue;
+      await gone(this.kaneo.deleteLabel(id));
+      delete m.labels[name];
+      this.save(row);
+    }
+    const parent = e.parentWo ? await this.woTask(e.parentWo) : null;
+    if ((m.parent?.taskId ?? null) !== parent) {
+      if (m.parent)
+        await gone(this.kaneo.deleteRelation(m.parent.relationId));
+      m.parent = parent ? { taskId: parent, relationId: (await this.kaneo.addSubtask(parent, row.taskId)).id } : null;
+      this.save(row);
+    }
+    if (e.resource && m.resource !== e.resource.url) {
+      await this.kaneo.addResource(row.taskId, e.resource.url, e.resource.title);
+      m.resource = e.resource.url;
+      this.save(row);
+    }
+    if (e.description !== null && m.description !== e.description) {
+      await this.kaneo.setDescription(row.taskId, e.description);
+      m.description = e.description;
+      this.save(row);
+    }
+    if (e.due && m.due !== e.due) {
+      await this.kaneo.setDueDate(row.taskId, e.due);
+      m.due = e.due;
+      this.save(row);
+    }
+  }
+  extrasStale(row, e) {
+    const m = row.meta;
+    const labels = Object.keys(m.labels);
+    if (labels.length !== e.labels.length || e.labels.some((l) => !m.labels[l]))
+      return true;
+    const parent = e.parentWo ? this.state.get("wo", e.parentWo)?.taskId ?? "missing" : null;
+    if ((m.parent?.taskId ?? null) !== parent)
+      return true;
+    if (e.resource && m.resource !== e.resource.url)
+      return true;
+    if (e.description !== null && m.description !== e.description)
+      return true;
+    return !!e.due && m.due !== e.due;
   }
   async comments(row, fresh = false) {
     const opal = row.kind === "issue" ? await this.api.issues.listComments({ id: row.opalId }) : await this.api.execution.listComments({ id: row.opalId });
@@ -15582,7 +15731,18 @@ class Sync {
     await (row.kind === "issue" ? this.issue(row.opalId) : this.workOrder(row.opalId));
   }
   lastPoll = null;
-  async all() {
+  all(full = false) {
+    if (this.running)
+      return this.running;
+    if (full)
+      this.lastPoll = null;
+    this.running = this.poll().finally(() => this.running = null);
+    return this.running;
+  }
+  get busy() {
+    return this.running !== null;
+  }
+  async poll() {
     const since = this.lastPoll;
     this.lastPoll = new Date().toISOString();
     const kaneoIds = new Set([this.config.issueProject, this.config.workOrderProject].filter((p) => !!p));
@@ -15601,39 +15761,46 @@ class Sync {
             commented.add(a.taskId);
     }
     const stale = (row, want) => {
-      if (!row || !since)
+      if (!since)
         return true;
       const t = board.get(row.taskId);
+      if (!t && kaneoIds.has(row.projectId))
+        return true;
       const same = (a, b) => a.title === b.title && a.priority === b.priority && a.status === b.status;
-      return commented.has(row.taskId) || !same(want, row.pushed) || t !== undefined && !same(t, row.pushed);
+      return commented.has(row.taskId) || !same(want.pushed, row.pushed) || t !== undefined && !same(t, row.pushed) || this.extrasStale(row, want.extras);
     };
+    const wos = [];
+    for await (const w of pages((cursor) => this.api.execution.list({ cursor, limit: 200 })))
+      wos.push(w);
+    const issues = [];
+    for await (const i of pages((cursor) => this.api.issues.list({ cursor, limit: 200 })))
+      issues.push(i);
+    for (const w of wos)
+      this.templates.set(w.id, w.procedureNumber);
+    const open = new Map;
+    for (const i of issues)
+      if (i.status === "open" && i.executionId)
+        open.set(i.executionId, (open.get(i.executionId) ?? 0) + 1);
     let synced = 0;
-    if (this.config.issueProject)
-      for await (const i of pages((cursor) => this.api.issues.list({ cursor, limit: 200 }))) {
-        const row = this.state.get("issue", i.id);
-        const want = {
-          title: `${i.issueNumber} ${i.title}`,
-          priority: TO_KANEO_PRIORITY[i.priority] ?? "medium",
-          status: this.config.issueColumns[issueState(i)]
-        };
-        if (row ? stale(row, want) : i.status !== "void") {
-          synced++;
-          await this.guard(`issue ${i.issueNumber}`, () => this.issue(i.id));
-        }
-      }
     if (this.config.workOrderProject)
-      for await (const w of pages((cursor) => this.api.execution.list({ cursor, limit: 200 }))) {
-        const want = {
-          title: `${w.woNumber} ${w.procedureName}`,
-          priority: TO_KANEO_PRIORITY[w.priority] ?? "medium",
-          status: this.config.workOrderColumns[w.status]
-        };
-        if (stale(this.state.get("wo", w.id), want)) {
-          synced++;
-          await this.guard(`work order ${w.woNumber}`, () => this.workOrder(w.id));
-        }
+      for (const w of wos) {
+        const row = this.state.get("wo", w.id);
+        const want = this.woWant(w, open.get(w.id) ?? 0);
+        if (row && !stale(row, want))
+          continue;
+        synced++;
+        await this.guard(`work order ${w.woNumber}`, () => this.locked(`wo:${w.id}`, () => this.woPass(w.id, open.get(w.id) ?? 0)));
       }
-    this.log(`poll: ${synced} synced, ${board.size} Kaneo tasks read`);
+    if (this.config.issueProject)
+      for (const i of issues) {
+        const row = this.state.get("issue", i.id);
+        const want = this.issueWant(i, i.executionId ? this.templates.get(i.executionId) ?? null : null);
+        if (row ? !stale(row, want) : i.status === "void")
+          continue;
+        synced++;
+        await this.guard(`issue ${i.issueNumber}`, () => this.issue(i.id, true));
+      }
+    this.log(`${since ? "poll" : "full sync"}: ${synced} synced, ${board.size} Kaneo tasks read`);
   }
   async guard(what, fn) {
     try {
@@ -15641,6 +15808,14 @@ class Sync {
     } catch (e) {
       this.log(`${what}: ${e.message}`);
     }
+  }
+}
+async function gone(p) {
+  try {
+    await p;
+  } catch (e) {
+    if (!(e instanceof KaneoError && e.status === 404))
+      throw e;
   }
 }
 async function* pages(get) {
@@ -15701,6 +15876,8 @@ var plugin_default = definePlugin({
     state = new State(ctx.dataDir);
     const me = await ctx.api.auth.me({});
     sync = new Sync(ctx.api, kaneo, state, config, me.id, ctx.log);
+    if (!config.publicUrl)
+      ctx.log("OPAL public URL is not set: tasks get no OPAL link");
     await registerWebhooks(ctx, config);
   },
   events: {
@@ -15745,6 +15922,7 @@ var plugin_default = definePlugin({
 						<tr><th>Task</th><td><a class="mono" href="${row.url}" target="_blank" rel="noopener">${row.pushed.title}</a></td></tr>
 						<tr><th>Column</th><td class="mono">${row.pushed.status}</td></tr>
 						<tr><th>Priority</th><td class="mono">${row.pushed.priority}</td></tr>
+						<tr><th>Labels</th><td>${Object.keys(row.meta.labels).map((l) => html`<span class="badge">${l}</span> `)}</td></tr>
 						<tr><th>Synced</th><td class="mono">${row.syncedAt.slice(0, 16).replace("T", " ")} UTC</td></tr>
 					</table>
 					<p><button id="sync">SYNC</button></p>` : html`<p class="muted">No task.</p><p><button id="sync">SYNC</button></p>`;
@@ -15779,6 +15957,14 @@ var plugin_default = definePlugin({
         }
       }
       return c.json({ items: cached.items });
+    });
+    app.post("/actions/sync", (c) => {
+      if (!sync)
+        return c.json({ error: "not_started", message: "The plugin is still starting" }, 503);
+      if (sync.busy)
+        return c.json({ message: "A sync is already running" });
+      sync.guard("full sync", () => sync.all(true));
+      return c.json({ message: "Full sync started" });
     });
     app.post("/sync", async (c) => {
       if (!sync)

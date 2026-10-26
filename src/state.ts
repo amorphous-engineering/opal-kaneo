@@ -26,7 +26,23 @@ export interface TaskRow {
 	/** Newest OPAL comment id already copied to Kaneo (or written by this plugin). */
 	lastOpalComment: number;
 	syncedAt: string;
+	/** What the plugin last wrote that only goes from OPAL to Kaneo. */
+	meta: Meta;
 }
+
+/** One-way fields, as written to Kaneo. */
+export interface Meta {
+	/** Label name → Kaneo label id. Kaneo labels belong to one task each. */
+	labels: Record<string, string>;
+	/** The work order task this task is a subtask of, and the Kaneo relation. */
+	parent: { taskId: string; relationId: string } | null;
+	/** OPAL link added as a resource. */
+	resource: string | null;
+	description: string | null;
+	due: string | null;
+}
+
+export const emptyMeta = (): Meta => ({ labels: {}, parent: null, resource: null, description: null, due: null });
 
 interface RawRow {
 	kind: Kind;
@@ -38,6 +54,7 @@ interface RawRow {
 	pushed: string;
 	last_opal_comment: number;
 	synced_at: string;
+	meta: string | null;
 }
 
 const fromRaw = (r: RawRow): TaskRow => ({
@@ -49,7 +66,8 @@ const fromRaw = (r: RawRow): TaskRow => ({
 	url: r.url,
 	pushed: JSON.parse(r.pushed) as Pushed,
 	lastOpalComment: r.last_opal_comment,
-	syncedAt: r.synced_at
+	syncedAt: r.synced_at,
+	meta: { ...emptyMeta(), ...(r.meta ? (JSON.parse(r.meta) as Partial<Meta>) : {}) }
 });
 
 export class State {
@@ -63,6 +81,9 @@ export class State {
 			project_id TEXT NOT NULL, workspace_id TEXT NOT NULL, url TEXT NOT NULL,
 			pushed TEXT NOT NULL, last_opal_comment INTEGER NOT NULL DEFAULT 0, synced_at TEXT NOT NULL,
 			PRIMARY KEY (kind, opal_id))`);
+		// Added in 0.4.0: tasks made earlier start with an empty meta and get it on their next pass.
+		const cols = this.db.query<{ name: string }, []>('PRAGMA table_info(task)').all();
+		if (!cols.some((c) => c.name === 'meta')) this.db.run('ALTER TABLE task ADD COLUMN meta TEXT');
 		this.db.run(`CREATE TABLE IF NOT EXISTS seen_comment (
 			task_id TEXT NOT NULL, comment_id TEXT NOT NULL, PRIMARY KEY (task_id, comment_id))`);
 	}
@@ -87,11 +108,11 @@ export class State {
 	save(row: TaskRow): void {
 		this.db
 			.query(
-				`INSERT INTO task (kind, opal_id, task_id, project_id, workspace_id, url, pushed, last_opal_comment, synced_at)
-				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+				`INSERT INTO task (kind, opal_id, task_id, project_id, workspace_id, url, pushed, last_opal_comment, synced_at, meta)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 				 ON CONFLICT (kind, opal_id) DO UPDATE SET task_id = excluded.task_id, project_id = excluded.project_id,
 				 workspace_id = excluded.workspace_id, url = excluded.url, pushed = excluded.pushed,
-				 last_opal_comment = excluded.last_opal_comment, synced_at = excluded.synced_at`
+				 last_opal_comment = excluded.last_opal_comment, synced_at = excluded.synced_at, meta = excluded.meta`
 			)
 			.run(
 				row.kind,
@@ -102,7 +123,8 @@ export class State {
 				row.url,
 				JSON.stringify(row.pushed),
 				row.lastOpalComment,
-				row.syncedAt
+				row.syncedAt,
+				JSON.stringify(row.meta)
 			);
 	}
 

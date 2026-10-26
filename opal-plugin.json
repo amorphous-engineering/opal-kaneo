@@ -1,8 +1,8 @@
 {
 	"id": "kaneo",
 	"name": "Kaneo",
-	"version": "0.3.2",
-	"opal": ">=2.0.0-rc.16",
+	"version": "0.4.0",
+	"opal": ">=2.0.0-rc.18",
 	"main": "dist/plugin.js",
 	"summary": "Sync issues and work orders with Kaneo tasks.",
 	"permissions": {
@@ -76,6 +76,12 @@
 			"slot": "execution.side",
 			"title": "Kaneo",
 			"path": "/panel/execution"
+		}
+	],
+	"actions": [
+		{
+			"label": "Sync",
+			"path": "/actions/sync"
 		}
 	]
 }
