@@ -11053,7 +11053,7 @@ var execution = {
 
 // ../../OPAL/packages/shared/src/domains/plugins.ts
 var PANEL_SLOTS = ["issue.side", "part.side", "execution.side", "project.side"];
-var PLUGIN_SETTING_TYPES = ["text", "url", "secret", "number", "boolean", "select", "json"];
+var PLUGIN_SETTING_TYPES = ["text", "url", "secret", "number", "boolean", "select", "json", "project-map"];
 var zInnerPath = string2().min(1).max(200).refine((p) => !p.startsWith("/") && !p.split(/[\\/]/).includes(".."), "Must be a relative path inside the plugin");
 var zOpPattern = string2().regex(/^[a-z][a-zA-Z0-9]*(\.[a-zA-Z0-9]+)*(\.\*)?$|^\*$/, "Operation name or pattern");
 var zEventPattern = string2().regex(/^[a-z_]+\*?$|^\*$/, "Event type or pattern");
@@ -11063,7 +11063,11 @@ var zPluginSettingDef = strictObject({
   type: _enum(PLUGIN_SETTING_TYPES),
   required: boolean2().optional(),
   options: array(string2().min(1).max(80)).max(50).optional(),
+  optionsFrom: string2().regex(/^\/[^\s?#]*$/).max(200).optional(),
   default: union([string2(), number2(), boolean2()]).optional()
+});
+var zPluginOptions = object({
+  items: array(object({ value: string2(), label: string2() }))
 });
 var zPluginPanelDef = strictObject({
   slot: _enum(PANEL_SLOTS),
@@ -15165,6 +15169,12 @@ class Kaneo {
   taskUrl(task, workspaceId) {
     return `${this.base}/dashboard/workspace/${workspaceId}/project/${task.projectId}/task/${task.id}`;
   }
+  workspaces() {
+    return this.call("GET", "/workspace");
+  }
+  projects(workspaceId) {
+    return this.call("GET", `/project?workspaceId=${encodeURIComponent(workspaceId)}`);
+  }
   project(id) {
     return this.call("GET", `/project/${encodeURIComponent(id)}`);
   }
@@ -15721,6 +15731,17 @@ var plugin_default = definePlugin({
     };
     app.get("/panel/issue", panel("issue", "issue"));
     app.get("/panel/execution", panel("wo", "execution"));
+    app.get("/options/projects", async (c) => {
+      if (!kaneo)
+        return c.json({ items: [] });
+      const spaces = await kaneo.workspaces();
+      const items = [];
+      for (const w of spaces)
+        for (const p of await kaneo.projects(w.id))
+          items.push({ value: p.id, label: `${spaces.length > 1 ? `${w.name} / ` : ""}${p.name} (${p.slug})` });
+      items.sort((a, b) => a.label.localeCompare(b.label));
+      return c.json({ items });
+    });
     app.post("/sync", async (c) => {
       if (!sync)
         return c.json({ error: "not started" }, 503);

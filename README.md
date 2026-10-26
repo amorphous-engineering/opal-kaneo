@@ -16,8 +16,8 @@ In OPAL, open Settings > Plugins and add this repository. Then set:
 |---|---|
 | Kaneo URL | `https://kaneo.example.com` |
 | API key | Kaneo > Settings > Account > API Keys |
-| Issue projects | `{ "OPAL-PROJECT-CODE": "<kaneo project id>" }` |
-| Work order projects | the same form, for work orders |
+| Issue projects | a Kaneo project for each OPAL project, from a dropdown once the plugin runs |
+| Work order projects | the same, for work orders |
 | Status columns | optional: `{ "issue": { "in_review": "review" }, "workOrder": { ... } }` |
 | OPAL public URL | an OPAL address Kaneo can reach. Needed for webhooks and task links. |
 | Webhook secret | any random string. With the public URL, the plugin sets the webhook on each mapped Kaneo project. |

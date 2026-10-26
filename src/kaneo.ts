@@ -84,6 +84,14 @@ export class Kaneo {
 		return `${this.base}/dashboard/workspace/${workspaceId}/project/${task.projectId}/task/${task.id}`;
 	}
 
+	workspaces() {
+		return this.call<{ id: string; name: string }[]>('GET', '/workspace');
+	}
+
+	projects(workspaceId: string) {
+		return this.call<KaneoProject[]>('GET', `/project?workspaceId=${encodeURIComponent(workspaceId)}`);
+	}
+
 	project(id: string) {
 		return this.call<KaneoProject>('GET', `/project/${encodeURIComponent(id)}`);
 	}

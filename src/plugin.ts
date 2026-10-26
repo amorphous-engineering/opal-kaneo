@@ -123,6 +123,18 @@ export default definePlugin({
 		app.get('/panel/issue', panel('issue', 'issue'));
 		app.get('/panel/execution', panel('wo', 'execution'));
 
+		// The settings form offers these in its project dropdowns.
+		app.get('/options/projects', async (c) => {
+			if (!kaneo) return c.json({ items: [] });
+			const spaces = await kaneo.workspaces();
+			const items: { value: string; label: string }[] = [];
+			for (const w of spaces)
+				for (const p of await kaneo.projects(w.id))
+					items.push({ value: p.id, label: `${spaces.length > 1 ? `${w.name} / ` : ''}${p.name} (${p.slug})` });
+			items.sort((a, b) => a.label.localeCompare(b.label));
+			return c.json({ items });
+		});
+
 		app.post('/sync', async (c) => {
 			if (!sync) return c.json({ error: 'not started' }, 503);
 			const issue = Number(c.req.query('issue'));
