@@ -1,0 +1,82 @@
+{
+	"id": "kaneo",
+	"name": "Kaneo",
+	"version": "0.1.0",
+	"opal": ">=2.0.0-rc.13",
+	"main": "dist/plugin.js",
+	"summary": "Sync issues and work orders with Kaneo tasks.",
+	"permissions": {
+		"ops": [
+			"projects.list",
+			"issues.list",
+			"issues.get",
+			"issues.update",
+			"issues.start",
+			"issues.review",
+			"issues.returnFromReview",
+			"issues.listComments",
+			"issues.addComment",
+			"execution.list",
+			"execution.get",
+			"execution.listComments",
+			"execution.addComment"
+		],
+		"events": [
+			"record_changed"
+		],
+		"hooks": true
+	},
+	"settings": [
+		{
+			"key": "url",
+			"label": "Kaneo URL",
+			"type": "url",
+			"required": true
+		},
+		{
+			"key": "apiKey",
+			"label": "API key",
+			"type": "secret",
+			"required": true
+		},
+		{
+			"key": "issueProjects",
+			"label": "Issue projects",
+			"type": "json",
+			"default": "{}"
+		},
+		{
+			"key": "workOrderProjects",
+			"label": "Work order projects",
+			"type": "json",
+			"default": "{}"
+		},
+		{
+			"key": "statusColumns",
+			"label": "Status columns",
+			"type": "json"
+		},
+		{
+			"key": "publicUrl",
+			"label": "OPAL public URL",
+			"type": "url"
+		},
+		{
+			"key": "webhookSecret",
+			"label": "Webhook secret",
+			"type": "secret"
+		}
+	],
+	"panels": [
+		{
+			"slot": "issue.side",
+			"title": "Kaneo",
+			"path": "/panel/issue"
+		},
+		{
+			"slot": "execution.side",
+			"title": "Kaneo",
+			"path": "/panel/execution"
+		}
+	]
+}
