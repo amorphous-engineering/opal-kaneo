@@ -98,23 +98,24 @@ function fakeOpal() {
 				return c;
 			}
 		},
-		plugins: { links: { set: async (l: unknown) => void calls.push(`link ${JSON.stringify(l)}`) } },
-		org: { projects: { list: async () => ({ items: [{ id: 1, code: 'MOJ' }], next: null }) } }
+		plugins: { links: { set: async (l: unknown) => void calls.push(`link ${JSON.stringify(l)}`) } }
+
 	};
 	const personComment = (body: string) => issueComments.push({ id: ++cid, issueId: 4, user: { id: 1, name: 'Abby' }, body, createdAt: '' });
 	const personWoComment = (body: string) => woComments.push({ id: ++cid, executionId: 2, author: { id: 1, name: 'Abby' }, body, createdAt: '' });
 	return { api, issue, wo, calls, issueComments, woComments, personComment, personWoComment };
 }
 
-function setup() {
+function setup(over: Partial<Config> = {}) {
 	const kaneo = fakeKaneo();
 	const opal = fakeOpal();
 	const config: Config = {
-		issueProjects: { MOJ: 'kp1' },
-		workOrderProjects: { MOJ: 'kp2' },
+		issueProject: 'kp1',
+		workOrderProject: 'kp2',
 		issueColumns: DEFAULT_ISSUE_COLUMNS,
 		workOrderColumns: DEFAULT_WO_COLUMNS,
-		publicUrl: 'https://opal.test'
+		publicUrl: 'https://opal.test',
+		...over
 	};
 	const state = new State(mkdtempSync(join(tmpdir(), 'kaneo-')));
 	const logs: string[] = [];
@@ -189,11 +190,18 @@ describe('issues', () => {
 		expect(opalSide).toHaveLength(2);
 	});
 
-	test('an issue in a project with no mapping gets no task', async () => {
+	test('issues from every OPAL project go to the one Kaneo project', async () => {
 		const s = setup();
 		s.opal.issue.projectCode = 'OTHER';
 		await s.sync.issue(4);
-		expect(s.kaneo.tasks.size).toBe(0);
+		expect(s.only().projectId).toBe('kp1');
+	});
+
+	test('with no issue project set, issues get no task', async () => {
+		const s = setup({ issueProject: null });
+		await s.sync.issue(4);
+		await s.sync.all();
+		expect([...s.kaneo.tasks.values()].filter((t) => t.projectId === 'kp1')).toHaveLength(0);
 	});
 });
 

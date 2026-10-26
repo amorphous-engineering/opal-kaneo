@@ -13,9 +13,10 @@ import type { Kind, Pushed, State, TaskRow } from './state.ts';
 type Api = Client<typeof contracts>;
 
 export interface Config {
-	/** OPAL project code → Kaneo project id. */
-	issueProjects: Record<string, string>;
-	workOrderProjects: Record<string, string>;
+	/** Kaneo project that gets every OPAL issue. Null: issues do not sync. */
+	issueProject: string | null;
+	/** Kaneo project that gets every OPAL work order. Null: work orders do not sync. */
+	workOrderProject: string | null;
 	issueColumns: Record<IssueState, string>;
 	workOrderColumns: Record<WoState, string>;
 	/** Base URL people use to open OPAL, for links in task descriptions. */
@@ -96,7 +97,7 @@ export class Sync {
 
 	private async issuePass(id: number): Promise<void> {
 		const issue = await this.api.issues.get({ id });
-		const projectId = this.config.issueProjects[issue.projectCode];
+		const projectId = this.config.issueProject;
 		let row = this.state.get('issue', id);
 		if (!row) {
 			if (!projectId || issue.status === 'void') return;
@@ -175,7 +176,7 @@ export class Sync {
 
 	private async woPass(id: number): Promise<void> {
 		const wo = await this.api.execution.get({ id });
-		const projectId = this.config.workOrderProjects[wo.projectCode];
+		const projectId = this.config.workOrderProject;
 		const number = wo.woNumber;
 		const want: Pushed = {
 			title: `${number} ${wo.procedureName}`,
@@ -297,14 +298,14 @@ export class Sync {
 	private lastPoll: string | null = null;
 
 	/**
-	 * Every record of every mapped project. New records get a task. A record gets
-	 * a pass only when OPAL, the Kaneo board or Kaneo comments changed, so a poll
-	 * costs a few Kaneo calls per project, not per task.
+	 * Every issue and work order. New records get a task. A record gets a pass
+	 * only when OPAL, the Kaneo board or Kaneo comments changed, so a poll costs
+	 * a few Kaneo calls, not some for each task.
 	 */
 	async all(): Promise<void> {
 		const since = this.lastPoll;
 		this.lastPoll = new Date().toISOString();
-		const kaneoIds = new Set([...Object.values(this.config.issueProjects), ...Object.values(this.config.workOrderProjects)]);
+		const kaneoIds = new Set([this.config.issueProject, this.config.workOrderProject].filter((p): p is string => !!p));
 		const board = new Map<string, KaneoTask>();
 		const workspaces = new Set<string>();
 		for (const id of kaneoIds) {
@@ -325,15 +326,8 @@ export class Sync {
 		};
 
 		let synced = 0;
-		const projects = (await this.api.org.projects.list({ limit: 500 })).items;
-		const idOf = new Map(projects.map((p) => [p.code, p.id]));
-		for (const code of Object.keys(this.config.issueProjects)) {
-			const projectId = idOf.get(code);
-			if (!projectId) {
-				this.log(`issue project ${code} not found in OPAL`);
-				continue;
-			}
-			for await (const i of pages((cursor) => this.api.issues.list({ projectId, cursor, limit: 200 }))) {
+		if (this.config.issueProject)
+			for await (const i of pages((cursor) => this.api.issues.list({ cursor, limit: 200 }))) {
 				const row = this.state.get('issue', i.id);
 				const want: Pushed = {
 					title: `${i.issueNumber} ${i.title}`,
@@ -345,14 +339,8 @@ export class Sync {
 					await this.guard(`issue ${i.issueNumber}`, () => this.issue(i.id));
 				}
 			}
-		}
-		for (const code of Object.keys(this.config.workOrderProjects)) {
-			const projectId = idOf.get(code);
-			if (!projectId) {
-				this.log(`work order project ${code} not found in OPAL`);
-				continue;
-			}
-			for await (const w of pages((cursor) => this.api.execution.list({ projectId, cursor, limit: 200 }))) {
+		if (this.config.workOrderProject)
+			for await (const w of pages((cursor) => this.api.execution.list({ cursor, limit: 200 }))) {
 				const want: Pushed = {
 					title: `${w.woNumber} ${w.procedureName}`,
 					priority: TO_KANEO_PRIORITY[w.priority] ?? 'medium',
@@ -363,7 +351,6 @@ export class Sync {
 					await this.guard(`work order ${w.woNumber}`, () => this.workOrder(w.id));
 				}
 			}
-		}
 		this.log(`poll: ${synced} synced, ${board.size} Kaneo tasks read`);
 	}
 

@@ -1,13 +1,12 @@
 {
 	"id": "kaneo",
 	"name": "Kaneo",
-	"version": "0.2.0",
+	"version": "0.3.0",
 	"opal": ">=2.0.0-rc.16",
 	"main": "dist/plugin.js",
 	"summary": "Sync issues and work orders with Kaneo tasks.",
 	"permissions": {
 		"ops": [
-			"projects.list",
 			"issues.list",
 			"issues.get",
 			"issues.update",
@@ -40,15 +39,15 @@
 			"required": true
 		},
 		{
-			"key": "issueProjects",
-			"label": "Issue projects",
-			"type": "project-map",
+			"key": "issueProject",
+			"label": "Issue project",
+			"type": "select",
 			"optionsFrom": "/options/projects"
 		},
 		{
-			"key": "workOrderProjects",
-			"label": "Work order projects",
-			"type": "project-map",
+			"key": "workOrderProject",
+			"label": "Work order project",
+			"type": "select",
 			"optionsFrom": "/options/projects"
 		},
 		{

@@ -15363,7 +15363,7 @@ class Sync {
   }
   async issuePass(id) {
     const issue = await this.api.issues.get({ id });
-    const projectId = this.config.issueProjects[issue.projectCode];
+    const projectId = this.config.issueProject;
     let row = this.state.get("issue", id);
     if (!row) {
       if (!projectId || issue.status === "void")
@@ -15435,7 +15435,7 @@ class Sync {
   }
   async woPass(id) {
     const wo = await this.api.execution.get({ id });
-    const projectId = this.config.workOrderProjects[wo.projectCode];
+    const projectId = this.config.workOrderProject;
     const number = wo.woNumber;
     const want = {
       title: `${number} ${wo.procedureName}`,
@@ -15543,7 +15543,7 @@ class Sync {
   async all() {
     const since = this.lastPoll;
     this.lastPoll = new Date().toISOString();
-    const kaneoIds = new Set([...Object.values(this.config.issueProjects), ...Object.values(this.config.workOrderProjects)]);
+    const kaneoIds = new Set([this.config.issueProject, this.config.workOrderProject].filter((p) => !!p));
     const board = new Map;
     const workspaces = new Set;
     for (const id of kaneoIds) {
@@ -15566,15 +15566,8 @@ class Sync {
       return commented.has(row.taskId) || !same(want, row.pushed) || t !== undefined && !same(t, row.pushed);
     };
     let synced = 0;
-    const projects = (await this.api.org.projects.list({ limit: 500 })).items;
-    const idOf = new Map(projects.map((p) => [p.code, p.id]));
-    for (const code of Object.keys(this.config.issueProjects)) {
-      const projectId = idOf.get(code);
-      if (!projectId) {
-        this.log(`issue project ${code} not found in OPAL`);
-        continue;
-      }
-      for await (const i of pages((cursor) => this.api.issues.list({ projectId, cursor, limit: 200 }))) {
+    if (this.config.issueProject)
+      for await (const i of pages((cursor) => this.api.issues.list({ cursor, limit: 200 }))) {
         const row = this.state.get("issue", i.id);
         const want = {
           title: `${i.issueNumber} ${i.title}`,
@@ -15586,14 +15579,8 @@ class Sync {
           await this.guard(`issue ${i.issueNumber}`, () => this.issue(i.id));
         }
       }
-    }
-    for (const code of Object.keys(this.config.workOrderProjects)) {
-      const projectId = idOf.get(code);
-      if (!projectId) {
-        this.log(`work order project ${code} not found in OPAL`);
-        continue;
-      }
-      for await (const w of pages((cursor) => this.api.execution.list({ projectId, cursor, limit: 200 }))) {
+    if (this.config.workOrderProject)
+      for await (const w of pages((cursor) => this.api.execution.list({ cursor, limit: 200 }))) {
         const want = {
           title: `${w.woNumber} ${w.procedureName}`,
           priority: TO_KANEO_PRIORITY[w.priority] ?? "medium",
@@ -15604,7 +15591,6 @@ class Sync {
           await this.guard(`work order ${w.woNumber}`, () => this.workOrder(w.id));
         }
       }
-    }
     this.log(`poll: ${synced} synced, ${board.size} Kaneo tasks read`);
   }
   async guard(what, fn) {
@@ -15642,8 +15628,8 @@ function json(v, fallback) {
 function configOf(s) {
   const columns = json(s.statusColumns, {});
   return {
-    issueProjects: json(s.issueProjects, {}),
-    workOrderProjects: json(s.workOrderProjects, {}),
+    issueProject: typeof s.issueProject === "string" && s.issueProject ? s.issueProject : null,
+    workOrderProject: typeof s.workOrderProject === "string" && s.workOrderProject ? s.workOrderProject : null,
     issueColumns: { ...DEFAULT_ISSUE_COLUMNS, ...columns.issue },
     workOrderColumns: { ...DEFAULT_WO_COLUMNS, ...columns.workOrder },
     publicUrl: typeof s.publicUrl === "string" && s.publicUrl ? s.publicUrl : null
@@ -15654,7 +15640,7 @@ async function registerWebhooks(ctx, config) {
   if (!config.publicUrl || typeof secret !== "string" || !secret || !kaneo)
     return;
   const url = `${config.publicUrl.replace(/\/+$/, "")}/hooks/${ctx.id}/task`;
-  const projects = new Set([...Object.values(config.issueProjects), ...Object.values(config.workOrderProjects)]);
+  const projects = new Set([config.issueProject, config.workOrderProject].filter((p) => !!p));
   for (const p of projects) {
     try {
       await kaneo.setWebhook(p, url, secret);

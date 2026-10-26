@@ -28,8 +28,8 @@ function configOf(s: Record<string, unknown>): Config {
 		{}
 	);
 	return {
-		issueProjects: json(s.issueProjects, {}),
-		workOrderProjects: json(s.workOrderProjects, {}),
+		issueProject: typeof s.issueProject === 'string' && s.issueProject ? s.issueProject : null,
+		workOrderProject: typeof s.workOrderProject === 'string' && s.workOrderProject ? s.workOrderProject : null,
 		issueColumns: { ...DEFAULT_ISSUE_COLUMNS, ...columns.issue },
 		workOrderColumns: { ...DEFAULT_WO_COLUMNS, ...columns.workOrder },
 		publicUrl: typeof s.publicUrl === 'string' && s.publicUrl ? s.publicUrl : null
@@ -41,7 +41,7 @@ async function registerWebhooks(ctx: PluginContext, config: Config): Promise<voi
 	const secret = ctx.settings.webhookSecret;
 	if (!config.publicUrl || typeof secret !== 'string' || !secret || !kaneo) return;
 	const url = `${config.publicUrl.replace(/\/+$/, '')}/hooks/${ctx.id}/task`;
-	const projects = new Set([...Object.values(config.issueProjects), ...Object.values(config.workOrderProjects)]);
+	const projects = new Set([config.issueProject, config.workOrderProject].filter((p): p is string => !!p));
 	for (const p of projects) {
 		try {
 			await kaneo.setWebhook(p, url, secret);
